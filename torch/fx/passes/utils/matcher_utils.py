@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from collections import defaultdict
+from functools import reduce
 import copy
 import torch
 from torch.fx.graph import Graph
