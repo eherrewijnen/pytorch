@@ -8528,6 +8528,10 @@ class TestConsistency(TestCase):
         'native_layer_norm': ['torch.float32'],
         'nn.functional.layer_norm': ['torch.float32'],
         'nn.functional.bilinear': ['f32'],
+        'nn.functional.nll_loss': ['f32'],
+        'masked.var': ['b8', 'f32', 'i16', 'i32', 'i64', 'u8'],
+        'minreduction_with_dim': ['b8', 'f16', 'f32', 'i16', 'i32', 'i64', 'u8'],
+        'maxreduction_with_dim': ['b8', 'f16', 'f32', 'i16', 'i32', 'i64', 'u8'],
     }
 
 
