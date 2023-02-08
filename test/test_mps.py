@@ -8508,7 +8508,7 @@ class TestConsistency(TestCase):
         'vstack': ['b8', 'f16', 'f32', 'i16', 'i32', 'i64', 'u8'],
         'zero_': ['b8', 'f16', 'f32', 'i16', 'i32', 'i64', 'u8'],
         'where': ['b8', 'f16', 'f32', 'i16', 'i32', 'i64', 'u8'],
-        'nonzero': ['f32', 'i16', 'i32', 'i64'],
+        'nonzero': ['b8', 'u8', 'f16', 'f32', 'i16', 'i32', 'i64'],
         'cross': ['f16', 'f32', 'i16', 'i32', 'i64', 'u8'],
         'linalg.cross': ['f16', 'f32', 'i16', 'i32', 'i64', 'u8'],
         'unique_consecutive': ['b8', 'f16', 'f32', 'i16', 'i32', 'i64', 'u8'],
@@ -8756,8 +8756,6 @@ class TestConsistency(TestCase):
         'nn.functional.avg_pool2d': [torch.float32, torch.int64],
         'nn.functional.adaptive_avg_pool1d': [torch.float32],
         'nn.functional.adaptive_avg_pool2d': [torch.float32],
-        # count_nonzero returns wrong results for these dtypes
-        'nonzero': [torch.uint8, torch.float16],
 
         # failures due to lack of op implementation on MPS backend
         'put': ['torch.bool', 'torch.float16', 'torch.float32', 'torch.int16', 'torch.int32', 'torch.int64', 'torch.uint8'],
