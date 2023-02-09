@@ -4,6 +4,7 @@ from typing import Callable, Any, Dict, Tuple, Optional, Sequence, List, Set
 from torch.utils.hooks import RemovableHandle
 from torch.utils._python_dispatch import TorchDispatchMode
 from collections import defaultdict
+from .function import Function
 import weakref
 import abc
 
@@ -260,6 +261,309 @@ class save_on_cpu(saved_tensors_hooks):
             return tensor.to(device, non_blocking=pin_memory)
 
         super().__init__(pack_to_cpu, unpack_from_cpu)
+
+# NOTE: [Checkpoint that supports nesting]
+#
+# Contents:
+# - Semantics
+# - Mechanics
+#
+# Checkpointing Semantics (this should just be in the docs)
+# =========================================================
+#
+# Under a checkpoint context, any variables that would've been saved by
+# forward under this context would no longer be saved.
+#
+# Lifetime of recomputed variables
+# --------------------------------
+#
+# Recomputed variables only stay alive for the lifetime of a particular
+# backward.
+#
+# Backward within checkpoint
+# --------------------------
+#
+# If backward is performed inside a checkpoint context...
+#
+# with checkpoint():
+#    y = x.sin()                # saves x
+#    z = y.exp()                # saves z
+#    torch.autograd.grad(z, z)  # clears z, only x remains saved
+#                               # As we exit, clears x only
+#
+# Nested checkpointing
+# --------------------
+#
+# There is some specially handling for the nested case: the inputs to
+# are treated as saved variables in the parent context.
+#
+# with checkpoint0():
+#   with checkpoint1():          # saves `y` in check0
+#     y = f(x)                   # f's saved variables are cleared by check1
+#   with checkpoint2():          # saves `z` in check0
+#     z = g(y)                   # g's saved variables are cleared by check1
+#                                # exiting check0, clears `y` and `z`
+#                                # whatever f and g save are hidden#
+#
+# Early stopping
+# --------------
+#
+# Checkpointing Mechanics
+# =======================
+#
+# 1) Doing backward inside
+#
+# This explains why someone might unpack something packed during recomputation.
+# If someone tries to unpack this pack, that means that they are calling backward
+# in a checkpoint. No need to be nested. It is okay if we just save the tensor normally,
+# i.e. tie the tensor's lifetime to the recomputation graph because the recomputation graph will
+# die as soon as we finish recomputation.
+#
+# 2) Doing backward inside, but we are also nested
+#
+# This happens when doing backward within checkpoint. I need to have the ability
+# to recompute my top-level checkpoint WITHIN the recomputation stack. Consider the case:
+#
+# checkpoint
+#    checkpoint
+#       f
+#    backward
+#
+# During recomputation, the inner checkpoint is no longer nested, but we still want
+# to pretend as if it is, i.e., we need to save the inputs to parent, so that the
+# indices match up. However, if we do backward, during recomputation, we aren't able
+# able to recompute the outer parent to obtain the inputs that way since it isn't truly
+# nested. What we do is directly save to the current frame as well.
+#
+# Why is this okay to do?
+#
+# 2) Two disjoint backwards
+#
+# This answers the question of how can handle be None?
+#
+# We want to save in the recomputation graph even if handle is None, i.e., x has already
+# been cleared in the original graph. To see why this is the case,
+# consider the case where we do two separate backwards on disjoint parts of the graph,
+# we need to rerun that first backward to get to the second one.
+#
+#
+# To be done before landing:
+# - Test memory usage on CUDA and try to achieve potential the theoretical O(log(n))
+#   memory usage reduction
+# - Save and restore rng, autocast state
+# - Maybe support non-Tensor inputs *args, **kwargs, should just be an API issue.
+# - Finish writing the docs here
+#
+# Future work:
+# - Handling of free variables (?)
+#
+# Test (TODO):
+# - lifetime: clear tensors, but keep graph alive, see if recomputed stay alive
+#  (just temporary though, since we want to do per backward execution anyway)
+# - correctness: checkpoint and do two backwards inside  (should error if the first clears)
+# - what if someone tries to do double backward within recomputation
+
+class NoopSaveInputs(Function):
+    # autograd Function that saves inputs and returns them as-is
+    # TODO: We need to wrap this to emulate the requires_gradness of the inputs
+    @staticmethod
+    def forward(*args):
+        return args
+
+    @staticmethod
+    def setup_context(ctx: Any, inputs: Tuple[Any, ...], output: Any) -> None:
+        ctx.save_for_backward(*inputs)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        return grad_outputs
+
+class CheckpointFrame():
+    def __init__(self, parent: Optional["CheckpointFrame"], fn, target_frame=None):
+        # Why do we need to store parent weakly?
+        self.parent: Optional[weakref.ref[CheckpointFrame]] = \
+            weakref.ref(parent) if parent is not None else parent
+
+        # Stores a wrapped function, where the proper contexts are captured
+        self.fn = fn
+
+        self.weak_handles: List[Any] = []
+
+        self.recomputed: defaultdict[int, Dict[weakref.ref[_Handle], torch.Tensor]] = defaultdict(lambda: dict())
+        self.recomp_counter: defaultdict[int, int] = defaultdict(lambda: 0)
+        # Recomputation should only happen once.
+        self.is_recomputed: Dict[int, bool] = defaultdict(lambda: False)
+
+        # NOTE: [Nested Checkpoint Input Handling]
+        #
+        # Checkpoint frames need to store the inputs in order to recompute
+        # The simplest case is where there is no nesting, and we store args directly
+        # on the checkpoint frame.
+        #
+        # (1) Non-nested case
+        self.maybe_args: Optional[List[torch.Tensor]] = None
+
+        # (2) Nested case
+        #
+        # In the nested case however, we need to let the parent manage what we save
+        # and this includes the inputs of the child checkpoints.
+        #
+        # To try to reuse the logic of the parent checkpoint to handle these, we rely on
+        # a dummy autograd Function to pretend that inputs are also saved variables.
+        # Note that we must do this when the parent frame is still the top frame on the
+        # global checkpoint stack. We should also note that inputs differ from normal
+        # saved tensors in at least the following ways:
+        #
+        # - We cannot rely on packed idx or handle to identify them, since we don't unpack
+        #   before using inputs, we need to have access to inputs as soon as any of the
+        #   saved variables in that context.
+        # - We don't want or need to detach them.
+        #
+        # Therefore, we need a couple extra fields so to distinguish them later:
+        self.args_idx: Optional[List[int]] = None
+        # During receomputation, check this list to know which ones to not detach
+        # (we'd like to avoid detaching inputs)
+        self.child_args_idx : List[int] = []
+        # In the case where the parent has not exited, tensors have not been cleared from
+        # frame.saved_tensors[handle], and frame.recomputed[idx] would still be empty
+        self.args_handles: Optional[List[Any]] = None
+        self.target_frame: Optional[weakref.ref(CheckpointFrame)] = target_frame
+        self.target_frame_gid: int = -1
+
+    def __repr__(self):
+        return f"Frame(exit={int(self.exited)}, nest={int(self.is_nested())})"
+
+    def get_args_from_parent(self, gid):
+        assert self.parent is not None
+        parent_frame: Optional[CheckpointFrame] = self.parent()
+        assert parent_frame is not None
+        assert self.args_idx is not None
+        out = []
+        for idx in self.args_idx:
+            handle = parent_frame.weak_handles[idx]()
+            assert handle is not None
+            if handle:
+                out.append(parent_frame.recomputed[gid][handle])
+        return out
+
+    def save_args_to_parent(self, args):
+        assert self.parent is not None
+        parent_frame: Optional[CheckpointFrame] = self.parent()
+        assert parent_frame is not None
+        parent_pre_len = len(parent_frame.weak_handles)
+        new_args = NoopSaveInputs.apply(*args)  # TODO: fix require grad-ness
+        indices = list(range(parent_pre_len, len(parent_frame.weak_handles)))
+        parent_frame.child_args_idx.extend(indices)
+        self.args_idx = indices
+        self.args_handles = parent_frame.weak_handles[parent_pre_len: len(parent_frame.weak_handles)]
+        return new_args
+
+checkpoint_stacks: List[List[CheckpointFrame]] = []
+
+class StopRecomputationError(Exception):
+    pass
+
+class _checkpoint_hook(saved_tensors_hooks):
+    def __init__(self):
+        def pack_hook(x):
+            # Snapshot the state of the current checkpoint stack
+            current_frames = tuple(checkpoint_stacks[-1])
+            top_frame = current_frames[-1]
+            if top_frame.target_frame is not None:
+                target_frame = top_frame.target_frame()
+                assert target_frame is not None
+                gid = target_frame.target_frame_gid
+                assert gid != -1, "expected recomputation to be inside a backward call"
+                recomp_idx = target_frame.recomp_counter[gid]
+                target_frame.recomp_counter[gid] += 1
+                handle = target_frame.weak_handles[recomp_idx]()
+
+                if handle is not None:
+                    # See Checkpointing Mechanics (3) for when handle is None
+                    target_frame.recomputed[gid][handle] = \
+                        x if recomp_idx in target_frame.child_args_idx else x.detach()
+
+                if target_frame.recomp_counter[gid] == len(target_frame.weak_handles):
+                    raise StopRecomputationError()
+                # See Checkpointing Mechanics (1)
+                return x.detach(), None, None
+            else:
+                handle = _Handle()
+                top_frame.weak_handles.append(weakref.ref(handle))
+                return None, handle, current_frames
+
+        def unpack_hook(saved):
+            maybe_x, handle, frames = saved
+
+            if maybe_x is not None:
+                # See Checkpointing Mechanics (1)
+                return maybe_x
+
+            top_frame = frames[-1]
+            gid = torch._C._current_graph_task_id()
+            assert gid != -1, "expected unpack to be called inside a backward call"
+
+            if not top_frame.is_recomputed[gid]:
+                # Loop through the nested checkpoints
+                for frame in frames:
+                    if frame.target_frame is not None or frame.is_recomputed[gid]:
+                        continue
+                    # See NOTE [Nested Checkpoint Input Handling]
+                    if frame.parent is not None and frame.parent().target_frame is None:
+                        args = frame.get_args_from_parent(gid)
+                    else:
+                        assert frame.maybe_args is not None
+                        args = frame.maybe_args
+                    # Is this the right place?
+                    frame.target_frame_gid = gid
+                    try:
+                        checkpoint_stacks.append([CheckpointFrame(parent=None, fn=None, target_frame=weakref.ref(frame))])
+                        with _checkpoint_hook(), torch.autograd.enable_grad():
+                            frame.fn(*args)
+                    except StopRecomputationError as e:
+                        checkpoint_stacks.pop()
+                        pass
+                    # Do we need to reset?
+                    frame.target_frame_gid = -1
+                    frame.is_recomputed[gid] = True
+
+            return top_frame.recomputed[gid][handle]
+
+        super().__init__(pack_hook, unpack_hook)
+
+def get_wrapped_fn(fn):
+    # Capture the current context, so we can replay it
+    def wrapped(*args, **kwargs):
+        return fn(*args, **kwargs)
+    return wrapped
+
+def _checkpoint(fn, *args, **kwargs):
+    is_first_stack = len(checkpoint_stacks) == 0
+    if is_first_stack:
+        checkpoint_stacks.append([])
+    curr_stack = checkpoint_stacks[-1]
+    is_nested = len(curr_stack) > 0
+    curr_frame = CheckpointFrame(parent=curr_stack[-1] if is_nested else None, fn=get_wrapped_fn(fn))
+
+    # See NOTE [Nested Checkpoint Input Handling]
+    if is_nested:
+        args = curr_frame.save_args_to_parent(args)
+        if curr_frame.parent().target_frame is not None:
+            # See Checkpointing Mechanics (2)
+            curr_frame.maybe_args = args
+    else:
+        curr_frame.maybe_args = args
+
+    curr_stack.append(curr_frame)
+
+    with _checkpoint_hook():
+        ret = fn(*args, **kwargs)
+
+    curr_stack.pop()
+
+    if is_first_stack:
+        checkpoint_stacks.pop()
+    return ret
 
 
 @contextlib.contextmanager
